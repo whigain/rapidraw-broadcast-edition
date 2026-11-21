@@ -1,0 +1,28 @@
+{
+  "name": "rapidraw-broadcast-plugin",
+  "version": "0.1.0",
+  "description": "Early 2000s Television Broadcast look (3CCD / Digital Betacam / PAL-SD) — a RapidRAW plugin.",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "rapidraw",
+    "tauri",
+    "image-editing",
+    "broadcast",
+    "pal",
+    "standard-definition",
+    "television"
+  ],
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "install-plugin": "node installer/install.mjs",
+    "uninstall-plugin": "node installer/uninstall.mjs",
+    "test": "node --test --import tsx tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.0"
+  }
+}
