@@ -1,0 +1,13 @@
+{
+  "name": "rapidraw-broadcast-wrapper",
+  "version": "0.1.3",
+  "description": "Builds BroadcastPluginInstaller.exe (a Node SEA wrapper around broadcastinstaller.mjs).",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build-exe": "node build-exe.mjs",
+    "run-dev": "node broadcastinstaller.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

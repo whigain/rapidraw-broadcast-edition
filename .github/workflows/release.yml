@@ -1,0 +1,197 @@
+name: 'Release: Build & Package Early 2000s Broadcast Edition'
+
+# Mirrors upstream RapidRAW's release.yml pattern (on: release -> build -> upload
+# assets), adapted for this repo: this repo is a source-tree PATCHER + updater
+# wrapper, NOT a RapidRAW source checkout. So the job checks out a matching
+# RapidRAW source, applies the clean-room patch, builds the patched edition,
+# packages the self-installing wrapper EXE, assembles the signed release
+# manifest, and uploads the installer to the release that triggered the run.
+#
+# Required repository configuration (Settings -> Secrets and variables -> Actions):
+#   Variables:
+#     RAPIDRAW_REPO  owner/name of the RapidRAW source repo (default CyberTimon/RapidRAW)
+#     RAPIDRAW_REF   git tag/branch/SHA whose source matches this plugin's patch
+#                    anchors (the edition targets RapidRAW 1.7.0; set this to v1.7.0)
+#   Secrets:
+#     RAPIDRAW_RELEASE_SIGNING_KEY  the offline Ed25519 PRIVATE key (PEM) whose
+#                    public half is embedded in wrapper/release-public-key.pem.
+#                    The single-file build fails closed when this is missing.
+#
+# Trigger: publish a GitHub Release. You can also run it manually via
+# "Run workflow" to build artifacts without touching a release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      rapidraw_ref:
+        description: 'RapidRAW source ref (overrides the RAPIDRAW_REF variable)'
+        required: false
+        type: string
+      upload:
+        description: 'Upload built assets to an existing release tag'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Existing release tag used when upload=true (for example v0.1.1)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      RAPIDRAW_REPO: ${{ vars.RAPIDRAW_REPO || 'CyberTimon/RapidRAW' }}
+      RAPIDRAW_REF: ${{ github.event.inputs.rapidraw_ref || vars.RAPIDRAW_REF }}
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v5
+        with:
+          path: plugin
+
+      - name: Validate RapidRAW ref is configured
+        shell: bash
+        run: |
+          if [ -z "${RAPIDRAW_REF}" ]; then
+            echo "::error::RAPIDRAW_REF is not set. Define the repo variable RAPIDRAW_REF (the RapidRAW source ref whose files match this plugin's patch anchors, e.g. v1.7.0), or pass rapidraw_ref via 'Run workflow'."
+            exit 1
+          fi
+          echo "Building against ${RAPIDRAW_REPO}@${RAPIDRAW_REF}"
+
+      # RapidRAW's source is stored with LF; the plugin's patch anchors use LF.
+      # GitHub's Windows runners default to core.autocrlf=true, which would
+      # rewrite the checkout to CRLF and break every anchor match. Force LF.
+      - name: Force LF line endings for the RapidRAW checkout
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout RapidRAW source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.RAPIDRAW_REPO }}
+          ref: ${{ env.RAPIDRAW_REF }}
+          path: rapidraw
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rapidraw/src-tauri
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install plugin dependencies
+        working-directory: plugin
+        run: npm ci
+
+      # On a release, build the plugin AT the tag's version: stamp it into
+      # package.json (manifest pluginVersion) and the wrapper's VERSION banner.
+      - name: Sync plugin version from release tag
+        if: ${{ github.event_name == 'release' || inputs.release_tag != '' }}
+        working-directory: plugin
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          echo "Release tag ${RELEASE_TAG} -> plugin version ${ver}"
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='${ver}';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n');"
+          sed -i "s/const VERSION = '[^']*';/const VERSION = '${ver}';/" wrapper/broadcastinstaller.mjs
+          grep '"version"' package.json | head -1
+          grep "const VERSION =" wrapper/broadcastinstaller.mjs
+
+      - name: Plugin unit tests
+        working-directory: plugin
+        run: npm test
+
+      - name: Patch RapidRAW source (dry-run)
+        working-directory: plugin
+        run: node installer/install.mjs --rapidraw "../rapidraw" --dry-run
+
+      - name: Patch RapidRAW source
+        working-directory: plugin
+        run: node installer/install.mjs --rapidraw "../rapidraw"
+
+      - name: Install RapidRAW frontend dependencies
+        working-directory: rapidraw
+        run: npm ci
+
+      - name: Build patched RapidRAW (MSI + NSIS)
+        working-directory: rapidraw
+        run: npx tauri build --bundles nsis,msi
+
+      - name: Stage installers into plugin/dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p plugin/dist
+          cp rapidraw/src-tauri/target/release/bundle/nsis/RapidRAW_*-setup.exe plugin/dist/
+          cp rapidraw/src-tauri/target/release/bundle/msi/RapidRAW_*.msi plugin/dist/
+          ls -la plugin/dist
+
+      - name: Assemble signed embedded payload
+        working-directory: plugin
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.RAPIDRAW_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::RAPIDRAW_RELEASE_SIGNING_KEY secret is required for the single-file installer."
+            exit 1
+          fi
+          key="${RUNNER_TEMP}/release-ed25519.pem"
+          printf '%s' "$SIGNING_KEY" > "$key"
+          RAPIDRAW_RELEASE_SIGNING_KEY="$key" npm run assemble-release
+          rm -f "$key"
+
+      - name: Verify signed payload against embedded public key
+        working-directory: plugin
+        shell: bash
+        run: |
+          node --input-type=module -e "import { loadVerifiedRelease } from './wrapper/release-bundle.mjs'; import { RELEASE_PUBLIC_KEY_PEM } from './wrapper/release-public-key.mjs'; await loadVerifiedRelease('./dist', RELEASE_PUBLIC_KEY_PEM); console.log('Release payload verified against embedded public key');"
+
+      - name: Build one self-contained installer EXE (Node SEA)
+        working-directory: plugin
+        run: npm run build-exe
+
+      - name: Upload assets to the release
+        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.upload) }}
+        working-directory: plugin
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo "::error::release_tag is required when a manual run uses upload=true."
+            exit 1
+          fi
+          echo "Uploading single-file installer to ${TAG}: dist/BroadcastPluginInstaller.exe"
+          gh release upload "$TAG" dist/BroadcastPluginInstaller.exe --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Upload build artifacts (manual run without release upload)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.upload }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: broadcast-single-exe
+          path: plugin/dist/BroadcastPluginInstaller.exe
+          if-no-files-found: error
